@@ -390,7 +390,7 @@ async def search_series_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 context.user_data["search_results"].append({"title": title, "link": link})
                 keyboard.append([InlineKeyboardButton(title, callback_data=f"series_{idx}")])
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text("اختر المسلسل المناسب للتحميل:", reply_markup=reply_markup)
+        await update.message.reply_text(" اختر المسلسل المناسب للتحميل لو ملقتوش في التحميل شوفة من هنا /start:", reply_markup=reply_markup)
     except Exception as e:
         logger.error(f"خطأ في البحث عن المسلسلات للتحميل (User-Agent: {user_agent}): {e}")
         await update.message.reply_text("حدث خطأ أثناء البحث. حاول مرة أخرى.")
