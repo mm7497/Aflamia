@@ -1,27 +1,97 @@
 import requests
 from bs4 import BeautifulSoup
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ConversationHandler,
+    ContextTypes,
+    filters,
+)
+from telegram.error import BadRequest
 import logging
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime
+import cloudscraper
+from selectolax.parser import HTMLParser
+from retrying import retry
+import urllib.parse
+import random
 
 # إعداد التسجيل لتتبع الأخطاء
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# قائمة User-Agents لمحاكاة أجهزة مختلفة
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.1 Safari/605.1.15",
+    "Mozilla/5.0 (Linux; Android 10; SM-G975F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.120 Mobile Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 14_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.1 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36 Edg/91.0.864.59",
+    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:89.0) Gecko/20100101 Firefox/89.0",
+]
+
+# دالة لاختيار User-Agent عشوائي
+def get_random_user_agent():
+    return random.choice(USER_AGENTS)
+
 # المتغيرات الأساسية
 BASE_URL = "https://ak.sv"
 SEARCH_URL = BASE_URL + "/search"
+WECIMA_BASE_URL = "https://wecima.film"
+WECIMA_SEARCH_URL = WECIMA_BASE_URL + "/search/"
 TOKEN = "7514489443:AAEXW3fXRNNGdJwKOD6vXyK-jxx5ZrRTPIw"
 ADMIN_ID = 7234864373
 CHANNEL_ID = "-1002253732336"  # معرّف القناة الخاصة
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Referer": BASE_URL,
     "Accept-Language": "ar",
     "Accept-Encoding": "gzip, deflate"
 }
+WECIMA_HEADERS = {
+    "Referer": WECIMA_BASE_URL,
+    "Accept-Language": "ar",
+    "Accept-Encoding": "gzip, deflate"
+}
+LOADING_STICKER = "CAACAgIAAxkBAAEOXddoDE2NEQho0cVVpFJNUenNGZJwkwACVQADr8ZRGmTn_PAl6RC_NgQ"
+
+# حالات ConversationHandler
+(DOWNLOAD_MOVIE_QUERY, DOWNLOAD_SERIES_QUERY, WATCH_MOVIE_QUERY, WATCH_SERIES_QUERY) = range(4)
+
+# دالة للتحقق من صحة رابط التحميل
+def is_valid_download_link(link):
+    if not link:
+        return False
+    if ".mp4" in link or ".mkv" in link or "download" in link.lower():
+        return True
+    if link == BASE_URL or link.startswith(BASE_URL + "/?") or link.startswith(BASE_URL + "/#"):
+        return False
+    try:
+        response = requests.head(link, allow_redirects=True, timeout=5)
+        content_type = response.headers.get("content-type", "").lower()
+        return "video" in content_type or "application/octet-stream" in content_type
+    except Exception as e:
+        logger.error(f"خطأ أثناء التحقق من الرابط {link}: {e}")
+        return False
+
+# دالة لاستقبال الستيكرات وتسجيل معرفها
+async def handle_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if user_id != ADMIN_ID:
+        await update.message.reply_text("هذا الأمر مخصص للأدمن فقط!")
+        return
+    sticker = update.message.sticker
+    if sticker:
+        sticker_id = sticker.file_id
+        logger.info(f"Sticker ID: {sticker_id}")
+        await update.message.reply_text(f"معرف الستيكر: {sticker_id}\nأضف هذا المعرف إلى LOADING_STICKER في الكود.")
+    else:
+        await update.message.reply_text("لم يتم إرسال ستيكر! أرسل ستيكرًا متحركًا.")
 
 # إعداد قاعدة بيانات SQLite
 def init_db():
@@ -90,7 +160,7 @@ async def prompt_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE
     message = (
         f"⚠️ لاستخدام البوت، يجب عليك الاشتراك في قناتنا أولاً!\n"
         "📢 انضم إلى القناة ثم اضغط على 'تحقق من الاشتراك'.\n"
-        f"🕒 الوقت: {datetime.now().strftime('%H:%M:%S')}"  # إضافة علامة زمنية لتجنب "Message is not modified"
+        f"🕒 الوقت: {datetime.now().strftime('%H:%M:%S')}"
     )
     if update.message:
         await update.message.reply_text(message, reply_markup=reply_markup)
@@ -112,11 +182,14 @@ async def check_subscription_button(update: Update, context: ContextTypes.DEFAUL
         )
         welcome_message = (
             f"مرحبًا {user_name}! 🎉\n"
-            "أنا هنا لمساعدتك في البحث عن الأفلام والمسلسلات وإيجاد روابط التحميل بسهولة.\n"
-            "اختر ما تريد البحث عنه:\n"
-            "🎬 /movies - للأفلام\n"
-            "📺 /series - للمسلسلات\n"
-            "📜 /history - لعرض سجل البحث الخاص بك"
+            "أنا هنا لمساعدتك في تحميل أو مشاهدة الأفلام والمسلسلات.\n"
+            "اختر ما تريد:\n"
+            "🎬 /download_movie - لتحميل فيلم\n"
+            "📺 /download_series - لتحميل مسلسل\n"
+            "👀 /watch_movie - لمشاهدة فيلم\n"
+            "📽 /watch_series - لمشاهدة مسلسل\n"
+            "📜 /history - لعرض سجل البحث\n"
+            "🚫 /cancel - لإلغاء أي عملية"
         )
         await query.edit_message_text(welcome_message)
     else:
@@ -138,11 +211,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     welcome_message = (
         f"مرحبًا {user_name}! 🎉\n"
-        "أنا هنا لمساعدتك في البحث عن الأفلام والمسلسلات وإيجاد روابط التحميل بسهولة.\n"
-        "اختر ما تريد البحث عنه:\n"
-        "🎬 /movies - للأفلام\n"
-        "📺 /series - للمسلسلات\n"
-        "📜 /history - لعرض سجل البحث الخاص بك"
+        "أنا هنا لمساعدتك في تحميل أو مشاهدة الأفلام والمسلسلات.\n"
+        "اختر ما تريد:\n"
+        "🎬 /download_movie - لتحميل فيلم\n"
+        "📺 /download_series - لتحميل مسلسل\n"
+        "👀 /watch_movie - لمشاهدة فيلم\n"
+        "📽 /watch_series - لمشاهدة مسلسل\n"
+        "📜 /history - لعرض سجل البحث\n"
+        "🚫 /cancel - لإلغاء أي عملية"
     )
     await update.message.reply_text(welcome_message)
 
@@ -155,12 +231,17 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     history = get_user_search_history(user_id)
     if not history:
-        await update.message.reply_text("لم تقم بأي عمليات بحث بعد! ابدأ بالبحث باستخدام /movies أو /series.")
+        await update.message.reply_text("لم تقم بأي عمليات بحث بعد! ابدأ باستخدام الأوامر المتاحة.")
         return
     message = "📜 سجل البحث الأخير (آخر 5 عمليات):\n"
     for query, mode, timestamp in history:
-        mode_text = "فيلم" if mode == "movies" else "مسلسل"
-        message += f"🔍 البحث: {query}\nنوع: {mode_text}\nوقت البحث: {timestamp}\n"
+        mode_text = {
+            "download_movie": "تحميل فيلم",
+            "download_series": "تحميل مسلسل",
+            "watch_movie": "مشاهدة فيلم",
+            "watch_series": "مشاهدة مسلسل"
+        }.get(mode, mode)
+        message += f"🔍 البحث: {query}\nنوع: {mode_text}\nوقت البحث: {timestamp}\n\n"
     await update.message.reply_text(message)
 
 # دالة إرسال رسالة جماعية
@@ -188,56 +269,83 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"فشل إرسال الرسالة إلى {fail_count} مستخدم."
     )
 
-# دالة معالجة اختيار الأفلام
-async def start_movies(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# دوال التحميل
+async def start_download_movie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.message.from_user.id
     is_subscribed = await check_subscription(context, user_id)
     if not is_subscribed:
         await prompt_subscription(update, context)
-        return
-    context.user_data["mode"] = "movies"
-    await update.message.reply_text("اكتب اسم الفيلم الذي تريد البحث عنه 👇")
+        return ConversationHandler.END
+    # مسح الحالات الأخرى
+    context.user_data.pop("download_series_mode", None)
+    context.user_data.pop("watch_movie_mode", None)
+    context.user_data.pop("watch_series_mode", None)
+    context.user_data["download_movie_mode"] = True
+    await update.message.reply_text("اكتب اسم الفيلم الذي تريد تحميله 👇")
+    return DOWNLOAD_MOVIE_QUERY
 
-# دالة معالجة اختيار المسلسلات
-async def start_series(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def download_movie_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.message.from_user.id
     is_subscribed = await check_subscription(context, user_id)
     if not is_subscribed:
         await prompt_subscription(update, context)
-        return
-    context.user_data["mode"] = "series"
-    await update.message.reply_text("اكتب اسم المسلسل الذي تريد البحث عنه 👇")
-
-# دالة البحث العام
-async def search_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    is_subscribed = await check_subscription(context, user_id)
-    if not is_subscribed:
-        await prompt_subscription(update, context)
-        return
-    mode = context.user_data.get("mode")
-    if not mode:
-        await update.message.reply_text("يرجى تحديد ما تريد البحث عنه باستخدام /movies أو /series.")
-        return
+        return ConversationHandler.END
+    if not context.user_data.get("download_movie_mode"):
+        await update.message.reply_text("يرجى بدء عملية تحميل فيلم باستخدام /download_movie.")
+        return ConversationHandler.END
     query = update.message.text.strip()
-    add_search_history(user_id, query, mode)
-    if mode == "movies":
-        await search_movies_handler(update, context, query)
-    elif mode == "series":
-        await search_series_handler(update, context, query)
+    add_search_history(user_id, query, "download_movie")
+    user_agent = get_random_user_agent()
+    context.user_data["current_user_agent"] = user_agent
+    logger.info(f"بدء عملية بحث لتحميل فيلم: '{query}' بـ User-Agent: {user_agent}")
+    await search_movies_handler(update, context, query)
+    return ConversationHandler.END
 
-# دالة البحث عن الأفلام
+async def start_download_series(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.message.from_user.id
+    is_subscribed = await check_subscription(context, user_id)
+    if not is_subscribed:
+        await prompt_subscription(update, context)
+        return ConversationHandler.END
+    # مسح الحالات الأخرى
+    context.user_data.pop("download_movie_mode", None)
+    context.user_data.pop("watch_movie_mode", None)
+    context.user_data.pop("watch_series_mode", None)
+    context.user_data["download_series_mode"] = True
+    await update.message.reply_text("اكتب اسم المسلسل الذي تريد تحميله 👇")
+    return DOWNLOAD_SERIES_QUERY
+
+async def download_series_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.message.from_user.id
+    is_subscribed = await check_subscription(context, user_id)
+    if not is_subscribed:
+        await prompt_subscription(update, context)
+        return ConversationHandler.END
+    if not context.user_data.get("download_series_mode"):
+        await update.message.reply_text("يرجى بدء عملية تحميل مسلسل باستخدام /download_series.")
+        return ConversationHandler.END
+    query = update.message.text.strip()
+    add_search_history(user_id, query, "download_series")
+    user_agent = get_random_user_agent()
+    context.user_data["current_user_agent"] = user_agent
+    logger.info(f"بدء عملية بحث لتحميل مسلسل: '{query}' بـ User-Agent: {user_agent}")
+    await search_series_handler(update, context, query)
+    return ConversationHandler.END
+
 async def search_movies_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, query):
     try:
+        user_agent = context.user_data.get("current_user_agent", get_random_user_agent())
+        headers = {**HEADERS, "User-Agent": user_agent}
         params = {"q": query}
-        response = requests.get(SEARCH_URL, params=params, headers=HEADERS, timeout=10)
+        response = requests.get(SEARCH_URL, params=params, headers=headers, timeout=10)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
         results = soup.select('.entry-box.entry-box-1')
         if not results:
             await update.message.reply_text(
                 "🤷🏻‍♂️ لم يتم العثور على أفلام بهذا الاسم.\n"
-                "جرب كتابة اسم الفيلم بشكل مختلف أو ابحث عن ممثل."
+                "جرب كتابة اسم الفيلم بشكل مختلف أو ابحث عن ممثل.\n"
+                "👀 أو ممكن تشاهد بدون تحميل من قايمة /start"
             )
             return
         context.user_data["movie_results"] = []
@@ -251,24 +359,26 @@ async def search_movies_handler(update: Update, context: ContextTypes.DEFAULT_TY
             context.user_data["movie_results"].append({"title": title, "link": link})
             keyboard.append([InlineKeyboardButton(title, callback_data=f"movie_{idx}")])
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text("اختر الفيلم المناسب من القائمة أدناه:", reply_markup=reply_markup)
+        await update.message.reply_text("اختر الفيلم المناسب للتحميل:", reply_markup=reply_markup)
     except Exception as e:
-        logger.error(f"خطأ في البحث عن الأفلام: {e}")
+        logger.error(f"خطأ في البحث عن الأفلام للتحميل (User-Agent: {user_agent}): {e}")
         await update.message.reply_text(
             "🤷🏻‍♂️ لم يتم العثور على أفلام بهذا الاسم.\n"
             "جرب كتابة اسم الفيلم بشكل مختلف أو ابحث عن ممثل."
         )
 
-# دالة البحث عن المسلسلات
 async def search_series_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, query):
     try:
+        user_agent = context.user_data.get("current_user_agent", get_random_user_agent())
+        headers = {**HEADERS, "User-Agent": user_agent}
         params = {"q": query}
-        response = requests.get(SEARCH_URL, params=params, headers=HEADERS, timeout=10)
+        response = requests.get(SEARCH_URL, params=params, headers=headers, timeout=10)
         response.raise_for_status()
         soup = BeautifulSoup(response.content, "html.parser")
         results = soup.select(".widget .entry-box")
         if not results:
-            await update.message.reply_text("لم يتم العثور على نتائج. حاول البحث باسم آخر.")
+            await update.message.reply_text("لم يتم العثور على نتائج. حاول البحث باسم آخر.\n"
+                                           "📽 أو جرب مشاهدة المسلسل من /start")
             return
         context.user_data["search_results"] = []
         keyboard = []
@@ -280,16 +390,26 @@ async def search_series_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 context.user_data["search_results"].append({"title": title, "link": link})
                 keyboard.append([InlineKeyboardButton(title, callback_data=f"series_{idx}")])
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text("اختر المسلسل المناسب من القائمة أدناه:", reply_markup=reply_markup)
+        await update.message.reply_text("اختر المسلسل المناسب للتحميل:", reply_markup=reply_markup)
     except Exception as e:
-        logger.error(f"خطأ في البحث عن المسلسلات: {e}")
+        logger.error(f"خطأ في البحث عن المسلسلات للتحميل (User-Agent: {user_agent}): {e}")
         await update.message.reply_text("حدث خطأ أثناء البحث. حاول مرة أخرى.")
 
-# دالة استخراج الرابط النهائي
-def get_final_download_link(url, quality_id=None, is_episode=False):
+@retry(stop_max_attempt_number=3, wait_fixed=2000)
+def fetch_page(url, scraper=None, user_agent=None):
+    decoded_url = urllib.parse.unquote(url)
+    headers = {**HEADERS, "User-Agent": user_agent or get_random_user_agent()}
+    logger.info(f"جلب الصفحة: {decoded_url} بـ User-Agent: {headers['User-Agent']}")
+    if scraper:
+        response = scraper.get(decoded_url, headers=headers, timeout=10)
+    else:
+        response = requests.get(decoded_url, headers=headers, timeout=10)
+    response.raise_for_status()
+    return response
+
+def get_final_download_link(url, quality_id=None, is_episode=False, user_agent=None):
     try:
-        response = requests.get(url, headers=HEADERS, timeout=10)
-        response.raise_for_status()
+        response = fetch_page(url, user_agent=user_agent)
         soup = BeautifulSoup(response.text, 'html.parser')
         if is_episode:
             quality_selector = 'a[href="#tab-4"]'
@@ -312,27 +432,33 @@ def get_final_download_link(url, quality_id=None, is_episode=False):
             logger.error(f"لم يتم العثور على زر التحميل في {url}")
             return None
         intermediate_link = download_button['href']
-        response = requests.get(intermediate_link, headers=HEADERS, timeout=10)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'html.parser')
-        click_here_button = soup.select_one('a.download-link[href^="https://"]')
+        scraper = cloudscraper.create_scraper(browser={
+            'browser': 'chrome',
+            'platform': 'windows',
+            'mobile': False
+        })
+        response = fetch_page(intermediate_link, scraper, user_agent=user_agent)
+        tree = HTMLParser(response.text)
+        click_here_button = tree.css_first('a.download-link[href^="https://"]')
         if not click_here_button:
             logger.error(f"لم يتم العثور على رابط 'Click here' في {intermediate_link}")
             return None
-        direct_link_page = click_here_button['href']
-        response = requests.get(direct_link_page, headers=HEADERS, timeout=10)
-        response.raise_for_status()
+        direct_link_page = click_here_button.attributes.get('href')
+        response = fetch_page(direct_link_page, scraper, user_agent=user_agent)
         soup = BeautifulSoup(response.text, 'html.parser')
-        final_download_button = soup.select_one('a.link.btn.btn-light[download]')
+        final_download_button = soup.select_one('a[href][download], a.btn[href*="download"], a[href*=".mp4"]')
         if not final_download_button:
-            logger.error(f"لم يتم العثور على الرابط النهائي في {direct_link_page}")
+            logger.error(f"لم يتم العثور على الرابط النهائي في {direct_link_page}. HTML: {soup.prettify()[:500]}")
             return None
-        return final_download_button['href']
+        final_link = urllib.parse.unquote(final_download_button['href'])
+        if not is_valid_download_link(final_link):
+            logger.error(f"الرابط النهائي غير صالح: {final_link}")
+            return None
+        return final_link
     except Exception as e:
-        logger.error(f"خطأ أثناء استخراج الرابط من {url}: {e}")
+        logger.error(f"خطأ أثناء استخراج الرابط من {url} (User-Agent: {user_agent}): {e}")
         return None
 
-# دالة معالجة اختيار الفيلم
 async def handle_movie_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -349,12 +475,12 @@ async def handle_movie_selection(update: Update, context: ContextTypes.DEFAULT_T
     movie_url = movie_results[movie_index]["link"]
     context.user_data["movie_url"] = movie_url
     try:
-        response = requests.get(movie_url, headers=HEADERS, timeout=10)
-        response.raise_for_status()
+        user_agent = context.user_data.get("current_user_agent", get_random_user_agent())
+        response = fetch_page(movie_url, user_agent=user_agent)
         soup = BeautifulSoup(response.text, 'html.parser')
         quality_options = soup.select(".header-tabs.tabs li a")
         if not quality_options:
-            await query.edit_message_text("ما لقيتش جودات متاحة للفيلم ده.")
+            await query.edit_message_text("لم يتم العثور على جودات متاحة لهذا الفيلم.")
             return
         keyboard = []
         context.user_data["qualities"] = []
@@ -364,12 +490,11 @@ async def handle_movie_selection(update: Update, context: ContextTypes.DEFAULT_T
             context.user_data["qualities"].append({"text": quality_text, "id": quality_id})
             keyboard.append([InlineKeyboardButton(quality_text, callback_data=f"quality_{quality_text}")])
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text("اختر الجودة اللي عايزها:", reply_markup=reply_markup)
+        await query.edit_message_text("اختر الجودة المطلوبة للتحميل:", reply_markup=reply_markup)
     except Exception as e:
-        logger.error(f"خطأ في جلب الجودات من {movie_url}: {e}")
-        await query.edit_message_text("حدث خطأ أثناء جلب الجودات. حاول مرة أخرى.")
+        logger.error(f"خطأ في جلب الجودات من {movie_url} (User-Agent: {user_agent}): {e}")
+        await query.edit_message_text("حدث خطأ أثناء جلب الجودات. حاول مرة أخرى لاحقًا.")
 
-# دالة معالجة اختيار الجودة
 async def handle_quality_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -378,12 +503,29 @@ async def handle_quality_selection(update: Update, context: ContextTypes.DEFAULT
     if not is_subscribed:
         await prompt_subscription(update, context)
         return
-    await query.edit_message_text("⏳ جاري تجهيز رابط التحميل...")
+    try:
+        sticker_message = await query.message.reply_sticker(sticker=LOADING_STICKER)
+        context.user_data["sticker_message_id"] = sticker_message.message_id
+        context.user_data["sticker_chat_id"] = sticker_message.chat_id
+    except BadRequest as e:
+        logger.error(f"خطأ أثناء إرسال الستيكر: {e}")
+        await query.message.reply_text("⏳ جاري استخراج رابط التحميل...")
+    await query.edit_message_text("⏳ جاري استخراج رابط التحميل...")
     quality_selected = query.data.split("_")[1]
     qualities = context.user_data.get("qualities")
     movie_url = context.user_data.get("movie_url")
     if not qualities or not movie_url:
-        await query.edit_message_text("حصل خطأ. جرب تاني.")
+        try:
+            if "sticker_message_id" in context.user_data:
+                await context.bot.delete_message(
+                    chat_id=context.user_data["sticker_chat_id"],
+                    message_id=context.user_data["sticker_message_id"]
+                )
+                del context.user_data["sticker_message_id"]
+                del context.user_data["sticker_chat_id"]
+        except BadRequest as e:
+            logger.error(f"خطأ أثناء حذف رسالة الستيكر: {e}")
+        await query.edit_message_text("حدث خطأ. يرجى المحاولة مرة أخرى.")
         return
     quality_id = None
     for q in qualities:
@@ -391,23 +533,50 @@ async def handle_quality_selection(update: Update, context: ContextTypes.DEFAULT
             quality_id = q["id"]
             break
     if not quality_id:
-        await query.edit_message_text("الجودة مش موجودة. جرب تاني.")
+        try:
+            if "sticker_message_id" in context.user_data:
+                await context.bot.delete_message(
+                    chat_id=context.user_data["sticker_chat_id"],
+                    message_id=context.user_data["sticker_message_id"]
+                )
+                del context.user_data["sticker_message_id"]
+                del context.user_data["sticker_chat_id"]
+        except BadRequest as e:
+            logger.error(f"خطأ أثناء حذف رسالة الستيكر: {e}")
+        await query.edit_message_text("الجودة المختارة غير متوفرة. حاول مرة أخرى.")
         return
-    final_link = get_final_download_link(movie_url, quality_id=quality_id, is_episode=False)
-    if not final_link:
-        await query.edit_message_text("حدث خطأ أثناء استخراج رابط التحميل. جرب مرة أخرى.")
+    user_agent = context.user_data.get("current_user_agent", get_random_user_agent())
+    final_link = get_final_download_link(movie_url, quality_id=quality_id, is_episode=False, user_agent=user_agent)
+    try:
+        if "sticker_message_id" in context.user_data:
+            await context.bot.delete_message(
+                chat_id=context.user_data["sticker_chat_id"],
+                message_id=context.user_data["sticker_message_id"]
+            )
+            del context.user_data["sticker_message_id"]
+            del context.user_data["sticker_chat_id"]
+    except BadRequest as e:
+        logger.error(f"خطأ أثناء حذف رسالة الستيكر: {e}")
+    if not final_link or ".mp4" not in final_link:
+        message = (
+            "أسفين، دي مشكلة مؤقتة في الفيلم دا 😔\n"
+            "يمكنك مشاهدة الفيلم بدون تحميل باستخدام الأمر:\n"
+            "👀 /watch_movie"
+        )
+        await query.edit_message_text(message)
         return
     message = (
         "رابط تحميل الفيلم جاهز! 😊\n"
-        "اضغط هنا للتحميل:\n"
+        "اضغط على الزر للتحميل:\n"
         f"<a href='{final_link}'>📥 تحميل الفيلم</a>\n"
-        "لبحث جديد اختار القسم أولاً:\n"
-        "🎬 /movies - للأفلام\n"
-        "📺 /series - للمسلسلات"
+        "لبحث جديد اختر:\n"
+        "🎬 /download_movie\n"
+        "📺 /download_series\n"
+        "👀 /watch_movie\n"
+        "📽 /watch_series"
     )
     await query.edit_message_text(message, parse_mode="HTML")
 
-# دالة معالجة اختيار المسلسل
 async def series_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -423,8 +592,8 @@ async def series_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     series_url = series_results[selected_index]["link"]
     try:
-        response = requests.get(series_url, headers=HEADERS, timeout=10)
-        response.raise_for_status()
+        user_agent = context.user_data.get("current_user_agent", get_random_user_agent())
+        response = fetch_page(series_url, user_agent=user_agent)
         soup = BeautifulSoup(response.content, "html.parser")
         episodes = soup.select(".bg-primary2")
         if not episodes:
@@ -441,12 +610,11 @@ async def series_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data["episodes"].append({"title": cleaned_title, "link": link})
                 keyboard.append([InlineKeyboardButton(cleaned_title, callback_data=f"episode_{idx}")])
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text("اختر الحلقة المناسبة من القائمة أدناه:", reply_markup=reply_markup)
+        await query.edit_message_text("اختر الحلقة المناسبة للتحميل:", reply_markup=reply_markup)
     except Exception as e:
-        logger.error(f"خطأ في جلب الحلقات من {series_url}: {e}")
-        await query.edit_message_text("حدث خطأ أثناء جلب الحلقات. حاول مرة أخرى.")
+        logger.error(f"خطأ في جلب الحلقات من {series_url} (User-Agent: {user_agent}): {e}")
+        await query.edit_message_text("حدث خطأ أثناء جلب الحلقات. حاول مرة أخرى لاحقًا.")
 
-# دالة معالجة اختيار الحلقة
 async def episode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -455,43 +623,450 @@ async def episode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_subscribed:
         await prompt_subscription(update, context)
         return
-    await query.edit_message_text("⏳ جاري تجهيز رابط التحميل...")
+    try:
+        sticker_message = await query.message.reply_sticker(sticker=LOADING_STICKER)
+        context.user_data["sticker_message_id"] = sticker_message.message_id
+        context.user_data["sticker_chat_id"] = sticker_message.chat_id
+    except BadRequest as e:
+        logger.error(f"خطأ أثناء إرسال الستيكر: {e}")
+        await query.message.reply_text("⏳ جاري استخراج رابط التحميل...")
+    await query.edit_message_text("⏳ جاري استخراج رابط التحميل...")
     selected_index = int(query.data.split("_")[1])
     episodes_list = context.user_data.get("episodes")
     if not episodes_list or selected_index >= len(episodes_list):
+        try:
+            if "sticker_message_id" in context.user_data:
+                await context.bot.delete_message(
+                    chat_id=context.user_data["sticker_chat_id"],
+                    message_id=context.user_data["sticker_message_id"]
+                )
+                del context.user_data["sticker_message_id"]
+                del context.user_data["sticker_chat_id"]
+        except BadRequest as e:
+            logger.error(f"خطأ أثناء حذف رسالة الستيكر: {e}")
         await query.edit_message_text("اختيار غير صحيح. يرجى المحاولة مرة أخرى.")
         return
     episode_url = episodes_list[selected_index]["link"]
-    final_link = get_final_download_link(episode_url, is_episode=True)
-    if not final_link:
-        await query.edit_message_text("حدث خطأ أثناء استخراج رابط التحميل. جرب مرة أخرى.")
+    user_agent = context.user_data.get("current_user_agent", get_random_user_agent())
+    final_link = get_final_download_link(episode_url, is_episode=True, user_agent=user_agent)
+    try:
+        if "sticker_message_id" in context.user_data:
+            await context.bot.delete_message(
+                chat_id=context.user_data["sticker_chat_id"],
+                message_id=context.user_data["sticker_message_id"]
+            )
+            del context.user_data["sticker_message_id"]
+            del context.user_data["sticker_chat_id"]
+    except BadRequest as e:
+        logger.error(f"خطأ أثناء حذف رسالة الستيكر: {e}")
+    if not final_link or ".mp4" not in final_link:
+        message = (
+            "أسفين، دي مشكلة مؤقتة في الحلقة دي 😔\n"
+            "يمكنك مشاهدة الحلقة بدون تحميل باستخدام الأمر:\n"
+            "📽 /watch_series"
+        )
+        await query.edit_message_text(message)
         return
     message = (
         "رابط تحميل الحلقة جاهز! 😊\n"
-        "اضغط هنا للتحميل:\n"
+        "اضغط على الزر للتحميل:\n"
         f"<a href='{final_link}'>📥 تحميل الحلقة</a>\n"
-        "لبحث جديد اختار القسم أولاً:\n"
-        "🎬 /movies - للأفلام\n"
-        "📺 /series - للمسلسلات"
+        "لبحث جديد اختر:\n"
+        "🎬 /download_movie\n"
+        "📺 /download_series\n"
+        "👀 /watch_movie\n"
+        "📽 /watch_series"
     )
     await query.edit_message_text(message, parse_mode="HTML")
+
+# دوال المشاهدة
+async def start_watch_movie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.message.from_user.id
+    is_subscribed = await check_subscription(context, user_id)
+    if not is_subscribed:
+        await prompt_subscription(update, context)
+        return ConversationHandler.END
+    # مسح الحالات الأخرى
+    context.user_data.pop("download_movie_mode", None)
+    context.user_data.pop("download_series_mode", None)
+    context.user_data.pop("watch_series_mode", None)
+    context.user_data["watch_movie_mode"] = True
+    await update.message.reply_text("اكتب اسم الفيلم الذي تريد مشاهدته 👇")
+    return WATCH_MOVIE_QUERY
+
+async def watch_movie_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.message.from_user.id
+    is_subscribed = await check_subscription(context, user_id)
+    if not is_subscribed:
+        await prompt_subscription(update, context)
+        return ConversationHandler.END
+    if not context.user_data.get("watch_movie_mode"):
+        await update.message.reply_text("يرجى بدء عملية مشاهدة فيلم باستخدام /watch_movie.")
+        return ConversationHandler.END
+    query = update.message.text.strip()
+    add_search_history(user_id, query, "watch_movie")
+    user_agent = get_random_user_agent()
+    context.user_data["wecima_user_agent"] = user_agent
+    logger.info(f"بدء عملية بحث لمشاهدة فيلم: '{query}' بـ User-Agent: {user_agent}")
+    await search_wecima_films(update, context, query)
+    return ConversationHandler.END
+
+async def start_watch_series(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.message.from_user.id
+    is_subscribed = await check_subscription(context, user_id)
+    if not is_subscribed:
+        await prompt_subscription(update, context)
+        return ConversationHandler.END
+    # مسح الحالات الأخرى
+    context.user_data.pop("download_movie_mode", None)
+    context.user_data.pop("download_series_mode", None)
+    context.user_data.pop("watch_movie_mode", None)
+    context.user_data["watch_series_mode"] = True
+    await update.message.reply_text("اكتب اسم المسلسل الذي تريد مشاهدته 👇")
+    return WATCH_SERIES_QUERY
+
+async def watch_series_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.message.from_user.id
+    is_subscribed = await check_subscription(context, user_id)
+    if not is_subscribed:
+        await prompt_subscription(update, context)
+        return ConversationHandler.END
+    if not context.user_data.get("watch_series_mode"):
+        await update.message.reply_text("يرجى بدء عملية مشاهدة مسلسل باستخدام /watch_series.")
+        return ConversationHandler.END
+    query = update.message.text.strip()
+    add_search_history(user_id, query, "watch_series")
+    user_agent = get_random_user_agent()
+    context.user_data["wecima_user_agent"] = user_agent
+    logger.info(f"بدء عملية بحث لمشاهدة مسلسل: '{query}' بـ User-Agent: {user_agent}")
+    await search_wecima_series(update, context, query)
+    return ConversationHandler.END
+
+async def search_wecima_films(update: Update, context: ContextTypes.DEFAULT_TYPE, query):
+    try:
+        user_agent = context.user_data.get("wecima_user_agent", get_random_user_agent())
+        headers = {**WECIMA_HEADERS, "User-Agent": user_agent}
+        encoded_query = urllib.parse.quote(query)
+        search_url = f"{WECIMA_SEARCH_URL}{encoded_query}/"
+        response = requests.get(search_url, headers=headers, timeout=10)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        results = soup.select(".Grid--WecimaPosts .GridItem")
+        if not results:
+            await update.message.reply_text(
+                "🤷🏻‍♂️ لم يتم العثور على أفلام بهذا الاسم.\n"
+                "جرب كتابة اسم الفيلم بشكل مختلف."
+            )
+            return
+        context.user_data["wecima_film_results"] = []
+        keyboard = []
+        for idx, item in enumerate(results[:10]):
+            title_element = item.select_one(".Thumb--GridItem a strong")
+            link_element = item.select_one(".Thumb--GridItem a")
+            if title_element and link_element:
+                title = title_element.text.strip()
+                link = link_element['href']
+                if "/watch/" not in link:
+                    continue
+                context.user_data["wecima_film_results"].append({"title": title, "link": link})
+                keyboard.append([InlineKeyboardButton(title, callback_data=f"wecima_film_{idx}")])
+        if not keyboard:
+            await update.message.reply_text(
+                "🤷🏻‍♂️ لم يتم العثور على أفلام بهذا الاسم.\n"
+                "جرب كتابة اسم الفيلم بشكل مختلف."
+            )
+            return
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text("اختر الفيلم المناسب للمشاهدة:", reply_markup=reply_markup)
+    except Exception as e:
+        logger.error(f"خطأ في البحث عن الأفلام في wecima (User-Agent: {user_agent}): {e}")
+        await update.message.reply_text(
+            "🤷🏻‍♂️ حدث خطأ أثناء البحث. حاول مرة أخرى."
+        )
+
+async def search_wecima_series(update: Update, context: ContextTypes.DEFAULT_TYPE, query):
+    try:
+        user_agent = context.user_data.get("wecima_user_agent", get_random_user_agent())
+        headers = {**WECIMA_HEADERS, "User-Agent": user_agent}
+        encoded_query = urllib.parse.quote(query)
+        search_url = f"{WECIMA_SEARCH_URL}{encoded_query}/"
+        response = requests.get(search_url, headers=headers, timeout=10)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        results = soup.select(".Grid--WecimaPosts .GridItem")
+        if not results:
+            await update.message.reply_text(
+                "🤷🏻‍♂️ لم يتم العثور على مسلسلات بهذا الاسم.\n"
+                "جرب كتابة اسم المسلسل بشكل مختلف."
+            )
+            return
+        context.user_data["wecima_series_results"] = []
+        keyboard = []
+        for idx, item in enumerate(results[:10]):
+            title_element = item.select_one(".Thumb--GridItem a strong")
+            link_element = item.select_one(".Thumb--GridItem a")
+            if title_element and link_element:
+                title = title_element.text.strip()
+                link = link_element['href']
+                if "/series/" not in link:
+                    continue
+                context.user_data["wecima_series_results"].append({"title": title, "link": link})
+                keyboard.append([InlineKeyboardButton(title, callback_data=f"wecima_series_{idx}")])
+        if not keyboard:
+            await update.message.reply_text(
+                "🤷🏻‍♂️ لم يتم العثور على مسلسلات بهذا الاسم.\n"
+                "جرب كتابة اسم المسلسل بشكل مختلف."
+            )
+            return
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text("اختر المسلسل المناسب للمشاهدة:", reply_markup=reply_markup)
+    except Exception as e:
+        logger.error(f"خطأ في البحث عن المسلسلات في wecima (User-Agent: {user_agent}): {e}")
+        await update.message.reply_text(
+            "🤷🏻‍♂️ حدث خطأ أثناء البحث. حاول مرة أخرى."
+        )
+
+async def handle_wecima_film_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    is_subscribed = await check_subscription(context, user_id)
+    if not is_subscribed:
+        await prompt_subscription(update, context)
+        return
+    film_index = int(query.data.split("_")[2])
+    film_results = context.user_data.get("wecima_film_results")
+    if not film_results or film_index >= len(film_results):
+        await query.edit_message_text("لم يتم العثور على رابط الفيلم. حاول مرة أخرى.")
+        return
+    film_url = film_results[film_index]["link"]
+    try:
+        user_agent = context.user_data.get("wecima_user_agent", get_random_user_agent())
+        headers = {**WECIMA_HEADERS, "User-Agent": user_agent}
+        response = requests.get(film_url, headers=headers, timeout=10)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        server_button = soup.select_one(".MyCimaServer btn")
+        if not server_button:
+            await query.edit_message_text("لم يتم العثور على رابط مشاهدة لهذا الفيلم.")
+            return
+        stream_url = server_button.get("data-url")
+        if not stream_url:
+            await query.edit_message_text("لم يتم العثور على رابط مشاهدة لهذا الفيلم.")
+            return
+        message = (
+            "استمتع وشاهد الفيلم بدون تحميل! 😊\n"
+            f"<a href='{stream_url}'>📺 شاهد من هنا</a>\n"
+            "لبحث جديد اختر:\n"
+            "🎬 /download_movie\n"
+            "📺 /download_series\n"
+            "👀 /watch_movie\n"
+            "📽 /watch_series"
+        )
+        await query.edit_message_text(message, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"خطأ في جلب رابط المشاهدة من {film_url} (User-Agent: {user_agent}): {e}")
+        await query.edit_message_text("حدث خطأ أثناء جلب رابط المشاهدة. حاول مرة أخرى لاحقًا.")
+
+# دالة مساعدة لاستخراج الحلقات من صفحة
+async def extract_episodes(soup, context, query, series_url, user_agent):
+    episodes = soup.select(".Episodes--Seasons--Episodes a")
+    if not episodes:
+        await query.edit_message_text("لم يتم العثور على حلقات لهذا المسلسل.")
+        return False
+    context.user_data["wecima_episodes"] = []
+    keyboard = []
+    for idx, episode in enumerate(episodes):
+        title_element = episode.select_one("episodetitle")
+        link = episode['href']
+        if title_element:
+            title = title_element.text.strip()
+            context.user_data["wecima_episodes"].append({"title": title, "link": link})
+            keyboard.append([InlineKeyboardButton(title, callback_data=f"wecima_episode_{idx}")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text("اختر الحلقة المناسبة للمشاهدة:", reply_markup=reply_markup)
+    return True
+
+async def handle_wecima_series_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    is_subscribed = await check_subscription(context, user_id)
+    if not is_subscribed:
+        await prompt_subscription(update, context)
+        return
+    series_index = int(query.data.split("_")[2])
+    series_results = context.user_data.get("wecima_series_results")
+    if not series_results or series_index >= len(series_results):
+        await query.edit_message_text("اختيار غير صحيح. يرجى المحاولة مرة أخرى.")
+        return
+    series_url = series_results[series_index]["link"]
+    try:
+        user_agent = context.user_data.get("wecima_user_agent", get_random_user_agent())
+        headers = {**WECIMA_HEADERS, "User-Agent": user_agent}
+        response = requests.get(series_url, headers=headers, timeout=10)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        # التحقق من وجود مواسم
+        seasons = soup.select(".List--Seasons--Episodes a")
+        if seasons:
+            # إذا وجدت مواسم، اعرض قائمة المواسم
+            context.user_data["wecima_seasons"] = []
+            keyboard = []
+            for idx, season in enumerate(seasons):
+                season_title = season.text.strip()
+                season_link = season['href']
+                context.user_data["wecima_seasons"].append({"title": season_title, "link": season_link})
+                keyboard.append([InlineKeyboardButton(season_title, callback_data=f"wecima_season_{idx}")])
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text("اختر الموسم المناسب للمشاهدة:", reply_markup=reply_markup)
+        else:
+            # إذا لم توجد مواسم، استخرج الحلقات مباشرة
+            if not await extract_episodes(soup, context, query, series_url, user_agent):
+                await query.edit_message_text("لم يتم العثور على حلقات لهذا المسلسل.")
+    except Exception as e:
+        logger.error(f"خطأ في جلب المواسم أو الحلقات من {series_url} (User-Agent: {user_agent}): {e}")
+        await query.edit_message_text("حدث خطأ أثناء جلب المواسم أو الحلقات. حاول مرة أخرى لاحقًا.")
+
+async def handle_wecima_season_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    is_subscribed = await check_subscription(context, user_id)
+    if not is_subscribed:
+        await prompt_subscription(update, context)
+        return
+    season_index = int(query.data.split("_")[2])
+    seasons = context.user_data.get("wecima_seasons")
+    if not seasons or season_index >= len(seasons):
+        await query.edit_message_text("اختيار غير صحيح. يرجى المحاولة مرة أخرى.")
+        return
+    season_url = seasons[season_index]["link"]
+    try:
+        user_agent = context.user_data.get("wecima_user_agent", get_random_user_agent())
+        headers = {**WECIMA_HEADERS, "User-Agent": user_agent}
+        response = requests.get(season_url, headers=headers, timeout=10)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        if not await extract_episodes(soup, context, query, season_url, user_agent):
+            await query.edit_message_text("لم يتم العثور على حلقات لهذا الموسم.")
+    except Exception as e:
+        logger.error(f"خطأ في جلب الحلقات من {season_url} (User-Agent: {user_agent}): {e}")
+        await query.edit_message_text("حدث خطأ أثناء جلب الحلقات. حاول مرة أخرى لاحقًا.")
+
+async def handle_wecima_episode_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    is_subscribed = await check_subscription(context, user_id)
+    if not is_subscribed:
+        await prompt_subscription(update, context)
+        return
+    episode_index = int(query.data.split("_")[2])
+    episodes = context.user_data.get("wecima_episodes")
+    if not episodes or episode_index >= len(episodes):
+        await query.edit_message_text("اختيار غير صحيح. يرجى المحاولة مرة أخرى.")
+        return
+    episode_url = episodes[episode_index]["link"]
+    try:
+        user_agent = context.user_data.get("wecima_user_agent", get_random_user_agent())
+        headers = {**WECIMA_HEADERS, "User-Agent": user_agent}
+        response = requests.get(episode_url, headers=headers, timeout=10)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        server_button = soup.select_one(".MyCimaServer btn")
+        if not server_button:
+            await query.edit_message_text("لم يتم العثور على رابط مشاهدة لهذه الحلقة.")
+            return
+        stream_url = server_button.get("data-url")
+        if not stream_url:
+            await query.edit_message_text("لم يتم العثور على رابط مشاهدة لهذه الحلقة.")
+            return
+        message = (
+            "استمتع وشاهد الحلقة بدون تحميل! 😊\n"
+            f"<a href='{stream_url}'>📺 شاهد من هنا</a>\n"
+            "لبحث جديد اختر:\n"
+            "🎬 /download_movie\n"
+            "📺 /download_series\n"
+            "👀 /watch_movie\n"
+            "📽 /watch_series"
+        )
+        await query.edit_message_text(message, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"خطأ في جلب رابط المشاهدة من {episode_url} (User-Agent: {user_agent}): {e}")
+        await query.edit_message_text("حدث خطأ أثناء جلب رابط المشاهدة. حاول مرة أخرى لاحقًا.")
+
+# دالة الإلغاء
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("تم إلغاء العملية. اختر أمرًا جديدًا:\n"
+                                    "🎬 /download_movie\n"
+                                    "📺 /download_series\n"
+                                    "👀 /watch_movie\n"
+                                    "📽 /watch_series")
+    context.user_data.clear()
+    return ConversationHandler.END
 
 # إعداد البوت
 def main():
     logger.info("🤖 Aflamia bot is running...")
     init_db()
     application = Application.builder().token(TOKEN).build()
+
+    # ConversationHandler لتحميل الأفلام
+    download_movie_conv = ConversationHandler(
+        entry_points=[CommandHandler("download_movie", start_download_movie)],
+        states={
+            DOWNLOAD_MOVIE_QUERY: [MessageHandler(filters.TEXT & ~filters.COMMAND, download_movie_query)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    # ConversationHandler لتحميل المسلسلات
+    download_series_conv = ConversationHandler(
+        entry_points=[CommandHandler("download_series", start_download_series)],
+        states={
+            DOWNLOAD_SERIES_QUERY: [MessageHandler(filters.TEXT & ~filters.COMMAND, download_series_query)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    # ConversationHandler لمشاهدة الأفلام
+    watch_movie_conv = ConversationHandler(
+        entry_points=[CommandHandler("watch_movie", start_watch_movie)],
+        states={
+            WATCH_MOVIE_QUERY: [MessageHandler(filters.TEXT & ~filters.COMMAND, watch_movie_query)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    # ConversationHandler لمشاهدة المسلسلات
+    watch_series_conv = ConversationHandler(
+        entry_points=[CommandHandler("watch_series", start_watch_series)],
+        states={
+            WATCH_SERIES_QUERY: [MessageHandler(filters.TEXT & ~filters.COMMAND, watch_series_query)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    # إضافة المعالجات
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("movies", start_movies))
-    application.add_handler(CommandHandler("series", start_series))
-    application.add_handler(CommandHandler("broadcast", broadcast))
     application.add_handler(CommandHandler("history", history))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_content))
+    application.add_handler(CommandHandler("broadcast", broadcast))
+    application.add_handler(MessageHandler(filters.Sticker.ALL, handle_sticker))
+    application.add_handler(download_movie_conv)
+    application.add_handler(download_series_conv)
+    application.add_handler(watch_movie_conv)
+    application.add_handler(watch_series_conv)
     application.add_handler(CallbackQueryHandler(handle_movie_selection, pattern=r"^movie_\d+$"))
     application.add_handler(CallbackQueryHandler(series_callback, pattern=r"^series_\d+$"))
     application.add_handler(CallbackQueryHandler(episode_callback, pattern=r"^episode_\d+$"))
     application.add_handler(CallbackQueryHandler(handle_quality_selection, pattern=r"^quality_.+$"))
     application.add_handler(CallbackQueryHandler(check_subscription_button, pattern=r"^check_subscription$"))
+    application.add_handler(CallbackQueryHandler(handle_wecima_film_selection, pattern=r"^wecima_film_\d+$"))
+    application.add_handler(CallbackQueryHandler(handle_wecima_series_selection, pattern=r"^wecima_series_\d+$"))
+    application.add_handler(CallbackQueryHandler(handle_wecima_season_selection, pattern=r"^wecima_season_\d+$"))
+    application.add_handler(CallbackQueryHandler(handle_wecima_episode_selection, pattern=r"^wecima_episode_\d+$"))
+
     application.run_polling()
 
 if __name__ == "__main__":
