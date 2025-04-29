@@ -560,8 +560,8 @@ async def handle_quality_selection(update: Update, context: ContextTypes.DEFAULT
     if not final_link or ".mp4" not in final_link:
         message = (
             "أسفين، دي مشكلة مؤقتة في الفيلم دا 😔\n"
-            "يمكنك مشاهدة الفيلم بدون تحميل باستخدام الأمر:\n"
-            "👀 /watch_movie"
+            "يمكنك اختيار مشاهدة الفيلم بدون تحميل باستخدام الأمر:\n"
+            " /cancel"
         )
         await query.edit_message_text(message)
         return
@@ -662,8 +662,8 @@ async def episode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not final_link or ".mp4" not in final_link:
         message = (
             "أسفين، دي مشكلة مؤقتة في الحلقة دي 😔\n"
-            "يمكنك مشاهدة الحلقة بدون تحميل باستخدام الأمر:\n"
-            "📽 /watch_series"
+            "يمكنك اختيار مشاهدة الحلقة بدون تحميل باستخدام الأمر:\n"
+            "📽 /cancel"
         )
         await query.edit_message_text(message)
         return
