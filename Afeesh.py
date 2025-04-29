@@ -561,7 +561,7 @@ async def handle_quality_selection(update: Update, context: ContextTypes.DEFAULT
         message = (
             "أسفين، دي مشكلة مؤقتة في الفيلم دا 😔\n"
             "يمكنك اختيار مشاهدة الفيلم بدون تحميل باستخدام الأمر:\n"
-            " /cancel"
+            " /start"
         )
         await query.edit_message_text(message)
         return
@@ -663,7 +663,7 @@ async def episode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message = (
             "أسفين، دي مشكلة مؤقتة في الحلقة دي 😔\n"
             "يمكنك اختيار مشاهدة الحلقة بدون تحميل باستخدام الأمر:\n"
-            "📽 /cancel"
+            "📽 /start"
         )
         await query.edit_message_text(message)
         return
