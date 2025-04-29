@@ -1,10 +1,6 @@
-# المكتبات الأساسية
-python-telegram-bot==20.8  # مكتبة لإنشاء بوتات Telegram
-requests==2.31.0           # مكتبة لإرسال طلبات HTTP
-beautifulsoup4==4.12.3     # مكتبة لتحليل HTML وXML
-lxml>=4.9.0                # مكتبة لتحليل XML/HTML بسرعة
-
-# المكتبات الإضافية
-pytz==2023.3               # مكتبة للتعامل مع المناطق الزمنية
-apscheduler==3.10.4        # مكتبة لإضافة مهام جدولة (اختياري)
-sqlalchemy==2.0.25         # مكتبة لتحسين التعامل مع قواعد البيانات (اختياري)
+requests==2.31.0
+beautifulsoup4==4.12.3
+python-telegram-bot==20.0
+cloudscraper==1.2.71
+selectolax==0.3.21
+retrying==1.3.4
